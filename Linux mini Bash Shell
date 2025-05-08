@@ -1,0 +1,195 @@
+#include <stdio.h> //Standard input/output functions (printf, fgets, etc.).
+#include <stdlib.h> //General utilities (exit, malloc, etc.).
+#include <string.h> //String manipulation (strcpy, strtok, etc.)
+#include <unistd.h> //System calls (fork, execvp, getpid, etc.).
+#include <sys/types.h> //Process management (e.g., waitpid).
+#include <sys/wait.h>
+#include <errno.h> //Error handling
+#include <stdbool.h> //For using bool data type (true or false).
+
+#define DEFAULT_PROMPT "451sh> "
+
+// Function prototypes
+void type_prompt(const char *prompt);
+void read_command(char *command, char **parameters);
+void execute_builtin(const char *command, char **parameters);
+bool is_builtin(const char *command);
+void handle_builtin(const char *command, char **parameters);
+void check_background_processes();
+
+// List to track background process IDs
+pid_t background_pids[64];
+int bg_pid_count = 0;
+
+int main(int argc, char **argv) {
+
+    char *prompt = DEFAULT_PROMPT;
+    char command[1024];
+    char *parameters[64];
+    int status;
+
+    // Handle command line arguments for custom prompt
+    if (argc > 1 && strcmp(argv[1], "-p") == 0 && argc > 2) {
+        prompt = argv[2];
+    }
+
+    while (true) {
+        check_background_processes(); // Periodically check background processes
+        type_prompt(prompt);
+        read_command(command, parameters);
+
+        if (strcmp(command, "exit") == 0) {
+            break; // Exit the shell
+        }
+
+        if (is_builtin(command)) {
+            handle_builtin(command, parameters);
+            continue;
+        }
+
+        bool is_background = false;
+        int param_count = 0;
+        while (parameters[param_count] != NULL) {
+            param_count++;
+        }
+        if (param_count > 0 && strcmp(parameters[param_count - 1], "&") == 0) {
+            is_background = true;
+            parameters[param_count - 1] = NULL; // Remove '&' from parameters
+        }
+
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("Fork failed");
+            continue;
+        }
+
+        if (pid == 0) { // Child process
+            printf("[%d] %s\n", getpid(), command);
+            if (execvp(command, parameters) < 0) {
+                perror("Cannot execute command");
+                exit(255);
+            }
+        } else { // Parent process
+            if (is_background) {
+                printf("[%d] %s\n", pid, command);
+                background_pids[bg_pid_count++] = pid; // Track the background process ID
+            } else {
+                waitpid(pid, &status, 0);
+
+                if (WIFEXITED(status)) {
+                    printf("[%d] %s Exit %d\n", pid, command, WEXITSTATUS(status));
+                } else if (WIFSIGNALED(status)) {
+                    printf("[%d] %s Killed by signal %d\n", pid, command, WTERMSIG(status));
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+void type_prompt(const char *prompt) {
+    printf("%s", prompt);
+    fflush(stdout);
+}
+
+void read_command(char *command, char **parameters) {
+    char line[1024];
+
+    if (fgets(line, sizeof(line), 0) == NULL) {
+        fflush(stdout);
+        perror("fgets failed");
+        exit(255);
+    }
+
+    // Remove newline character
+    line[strcspn(line, "\n")] = '\0';
+
+    // Parse command and parameters
+    char *token = strtok(line, " ");
+    if (token == NULL) {
+        command[0] = '\0';
+        parameters[0] = NULL;
+        return;
+    }
+
+    strcpy(command, token);
+    int i = 0;
+
+    while (token != NULL) {
+        parameters[i++] = token;
+        token = strtok(NULL, " ");
+    }
+    parameters[i] = NULL;
+}
+
+bool is_builtin(const char *command) {
+    return (strcmp(command, "pid") == 0 || strcmp(command, "ppid") == 0 ||
+            strcmp(command, "cd") == 0 || strcmp(command, "pwd") == 0 ||
+            strcmp(command, "set") == 0 || strcmp(command, "get") == 0);
+}
+
+void handle_builtin(const char *command, char **parameters) {
+    if (strcmp(command, "pid") == 0) {
+        printf("Shell PID: %d\n", getpid());
+    } else if (strcmp(command, "ppid") == 0) {
+        printf("Parent PID: %d\n", getppid());
+    } else if (strcmp(command, "cd") == 0) {
+        if (parameters[1] == NULL) {
+            chdir(getenv("HOME"));
+        } else {
+            if (chdir(parameters[1]) < 0) {
+                perror("cd failed");
+            }
+        }
+    } else if (strcmp(command, "pwd") == 0) {
+        char cwd[1024];
+        if (getcwd(cwd, sizeof(cwd)) != NULL) {
+            printf("%s\n", cwd);
+        } else {
+            perror("getcwd failed");
+        }
+    } else if (strcmp(command, "set") == 0) {
+        if (parameters[1] == NULL) {
+            fprintf(stderr, "set: Missing variable name\n");
+        } else if (parameters[2] == NULL) {
+            unsetenv(parameters[1]);
+        } else {
+            setenv(parameters[1], parameters[2], 1);
+        }
+    } else if (strcmp(command, "get") == 0) {
+        if (parameters[1] == NULL) {
+            fprintf(stderr, "get: Missing variable name\n");
+        } else {
+            char *value = getenv(parameters[1]);
+            if (value) {
+                printf("%s\n", value);
+            } else {
+                printf("%s not set\n", parameters[1]);
+            }
+        }
+    }
+}
+
+void check_background_processes() {
+    int status;
+    pid_t pid;
+
+    // Check all background processes that have finished
+    for (int i = 0; i < bg_pid_count; i++) {
+        pid = waitpid(background_pids[i], &status, WNOHANG);
+
+        if (pid > 0) {
+            if (WIFEXITED(status)) {
+                printf("[%d] Exit %d\n", pid, WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                printf("[%d] Killed (%d)\n", pid, WTERMSIG(status));
+            }
+            // Remove the finished process from the background_pids list
+            background_pids[i] = background_pids[bg_pid_count - 1];
+            bg_pid_count--;
+            i--; // Adjust the index after removing
+        }
+    }
+}
